@@ -1,29 +1,61 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 SRC_DIR="${PROJECT_ROOT}/src"
+MANIFEST="${PROJECT_ROOT}/workspace.lock.repos"
 DO_UPDATE=0
 DRY_RUN=0
+VERIFY_ONLY=0
+SKIP_PACKAGE_CHECK=0
+REQUIRE_COLCON=0
+ALLOW_MOVING_REFS=0
+WITH_SUBMODULES=1
+
+CLONED_COUNT=0
+UPDATED_COUNT=0
+VERIFIED_COUNT=0
+PLANNED_COUNT=0
+BLOCKER_COUNT=0
 
 usage() {
 	cat <<EOF
 Usage:
   ${SCRIPT_NAME} [options]
 
+Restore the repository set declared by workspace.lock.repos. Locked commits are
+checked out in detached-HEAD state; this script never creates dependency branches
+and never runs git pull.
+
 Options:
-  --update            Update existing git repositories.
-  --src-dir <path>    Target ROS 2 src directory. Default: ${SRC_DIR}
-  --dry-run           Print planned actions without cloning or updating.
-  -h, --help          Show this help message.
+  --src-dir <path>       Target ROS 2 src directory. Default: ${SRC_DIR}
+  --manifest <path>      Repositories manifest. Default: ${MANIFEST}
+  --update               Sync existing clean repositories to the manifest ref.
+  --verify-only          Verify existing repositories without cloning/updating.
+  --dry-run              Print planned actions without changing files or Git refs.
+  --skip-submodules      Do not initialize recursive Git submodules.
+  --skip-package-check   Do not run colcon package discovery.
+  --require-colcon       Fail if colcon is unavailable or package discovery fails.
+  --allow-moving-refs    Permit tags/branches in a non-lock manifest.
+  -h, --help             Show this help message.
+
+Safety:
+  * Existing dirty repositories are never checked out or updated.
+  * Existing repositories with a different origin URL are rejected.
+  * Without --update, a repository at the wrong commit is rejected.
+  * Exact lock SHAs are verified after checkout.
 EOF
 }
 
 log() {
 	printf '%s\n' "$*"
+}
+
+warn() {
+	printf '[WARN] %s\n' "$*" >&2
 }
 
 die() {
@@ -36,19 +68,87 @@ require_command() {
 	command -v "${cmd}" >/dev/null 2>&1 || die "Required command not found: ${cmd}"
 }
 
+run_cmd() {
+	if [[ ${DRY_RUN} -eq 1 ]]; then
+		printf '[DRY] '
+		printf '%q ' "$@"
+		printf '\n'
+		return 0
+	fi
+
+	"$@"
+}
+
+absolute_path() {
+	local path="$1"
+	if [[ "${path}" == /* ]]; then
+		printf '%s\n' "${path}"
+	else
+		printf '%s/%s\n' "$(pwd)" "${path}"
+	fi
+}
+
+normalize_repo_url() {
+	local url="$1"
+	case "${url}" in
+		git@github.com:*)
+			url="https://github.com/${url#git@github.com:}"
+			;;
+		ssh://git@github.com/*)
+			url="https://github.com/${url#ssh://git@github.com/}"
+			;;
+	esac
+	url="${url%/}"
+	url="${url%.git}"
+	printf '%s\n' "${url}"
+}
+
+is_locked_sha() {
+	[[ "$1" =~ ^[0-9a-fA-F]{40}$ ]]
+}
+
+repo_is_dirty() {
+	[[ -n "$(git -C "$1" status --porcelain --untracked-files=normal)" ]]
+}
+
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-		--update)
-			DO_UPDATE=1
-			shift
-			;;
 		--src-dir)
 			[[ $# -ge 2 ]] || die "--src-dir requires a path"
 			SRC_DIR="$2"
 			shift 2
 			;;
+		--manifest)
+			[[ $# -ge 2 ]] || die "--manifest requires a path"
+			MANIFEST="$2"
+			shift 2
+			;;
+		--update)
+			DO_UPDATE=1
+			shift
+			;;
+		--verify-only)
+			VERIFY_ONLY=1
+			shift
+			;;
 		--dry-run)
 			DRY_RUN=1
+			shift
+			;;
+		--skip-submodules)
+			WITH_SUBMODULES=0
+			shift
+			;;
+		--skip-package-check)
+			SKIP_PACKAGE_CHECK=1
+			shift
+			;;
+		--require-colcon)
+			REQUIRE_COLCON=1
+			shift
+			;;
+		--allow-moving-refs)
+			ALLOW_MOVING_REFS=1
 			shift
 			;;
 		-h | --help)
@@ -61,265 +161,348 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-require_command git
+[[ ${DO_UPDATE} -eq 0 || ${VERIFY_ONLY} -eq 0 ]] || die "--update and --verify-only cannot be combined"
+[[ ${SKIP_PACKAGE_CHECK} -eq 0 || ${REQUIRE_COLCON} -eq 0 ]] || die "--skip-package-check and --require-colcon cannot be combined"
 
-if [[ "${SRC_DIR}" != /* ]]; then
-	SRC_DIR="$(pwd)/${SRC_DIR}"
-fi
+require_command git
+require_command awk
+
+SRC_DIR="$(absolute_path "${SRC_DIR}")"
+MANIFEST="$(absolute_path "${MANIFEST}")"
+[[ -f "${MANIFEST}" ]] || die "Manifest not found: ${MANIFEST}"
+
+manifest_data="$({
+	awk '
+	function trim(value) {
+		sub(/^[[:space:]]+/, "", value)
+		sub(/[[:space:]]+$/, "", value)
+		return value
+	}
+	function clean(value, first, last) {
+		value = trim(value)
+		first = substr(value, 1, 1)
+		last = substr(value, length(value), 1)
+		if ((first == "\"" && last == "\"") || (first == "\047" && last == "\047")) {
+			value = substr(value, 2, length(value) - 2)
+		}
+		return value
+	}
+	function emit() {
+		if (path == "") {
+			return
+		}
+		if (type != "git" || url == "" || version == "") {
+			printf "Invalid git entry for %s (type/url/version required)\n", path > "/dev/stderr"
+			bad = 1
+			return
+		}
+		printf "%s\t%s\t%s\n", path, url, version
+	}
+	BEGIN {
+		in_repositories = 0
+		path = ""
+		bad = 0
+	}
+	/^[[:space:]]*#/ { next }
+	/^repositories:[[:space:]]*$/ {
+		in_repositories = 1
+		next
+	}
+	in_repositories && /^  [^[:space:]][^:]*:[[:space:]]*$/ {
+		emit()
+		path = $0
+		sub(/^  /, "", path)
+		sub(/:[[:space:]]*$/, "", path)
+		type = ""
+		url = ""
+		version = ""
+		next
+	}
+	path != "" && /^    type:[[:space:]]*/ {
+		type = $0
+		sub(/^    type:[[:space:]]*/, "", type)
+		type = clean(type)
+		next
+	}
+	path != "" && /^    url:[[:space:]]*/ {
+		url = $0
+		sub(/^    url:[[:space:]]*/, "", url)
+		url = clean(url)
+		next
+	}
+	path != "" && /^    version:[[:space:]]*/ {
+		version = $0
+		sub(/^    version:[[:space:]]*/, "", version)
+		version = clean(version)
+		next
+	}
+	END {
+		emit()
+		if (!in_repositories) {
+			print "Missing top-level repositories mapping" > "/dev/stderr"
+			bad = 1
+		}
+		exit bad
+	}
+	' "${MANIFEST}"
+})" || die "Failed to parse manifest: ${MANIFEST}"
+
+[[ -n "${manifest_data}" ]] || die "Manifest contains no repositories: ${MANIFEST}"
+mapfile -t REPOSITORIES <<<"${manifest_data}"
+
+declare -A SEEN_TARGETS=()
+for record in "${REPOSITORIES[@]}"; do
+	IFS=$'\t' read -r manifest_path repo_url repo_ref <<<"${record}"
+	[[ "${manifest_path}" == src/* ]] || die "Manifest path must be below src/: ${manifest_path}"
+	target_dir="${manifest_path#src/}"
+	if [[ -z "${target_dir}" || "${target_dir}" == /* || "${target_dir}" =~ (^|/)\.\.?(/|$) ]]; then
+		die "Unsafe manifest target: ${manifest_path}"
+	fi
+	[[ -z "${SEEN_TARGETS[${target_dir}]:-}" ]] || die "Duplicate manifest target: ${target_dir}"
+	SEEN_TARGETS[${target_dir}]=1
+
+	if ! is_locked_sha "${repo_ref}" && [[ ${ALLOW_MOVING_REFS} -eq 0 ]]; then
+		die "Manifest ref is not a 40-character lock SHA for ${manifest_path}: ${repo_ref}. Use --allow-moving-refs only when intentional."
+	fi
+done
 
 if [[ ${DRY_RUN} -eq 1 ]]; then
-	if [[ ! -d "${SRC_DIR}" ]]; then
-		log "[DRY] mkdir -p ${SRC_DIR}"
-	fi
-else
+	[[ -d "${SRC_DIR}" ]] || log "[DRY] mkdir -p ${SRC_DIR}"
+elif [[ ${VERIFY_ONLY} -eq 0 ]]; then
 	mkdir -p "${SRC_DIR}"
 fi
 
-if [[ ${DRY_RUN} -eq 0 && ! -d "${SRC_DIR}" ]]; then
-	die "Failed to create src directory: ${SRC_DIR}"
-fi
-
 log "Project root: ${PROJECT_ROOT}"
-log "Target src:   ${SRC_DIR}"
+log "Manifest:     ${MANIFEST}"
+log "Target src:  ${SRC_DIR}"
+log "Repositories:${#REPOSITORIES[@]}"
+log "Checkout:    detached HEAD"
 
-run_cmd() {
-	if [[ ${DRY_RUN} -eq 1 ]]; then
-		printf '[DRY] '
-		printf '%q ' "$@"
-		printf '\n'
-		return 0
-	fi
-
-	"$@"
-}
-
-ref_exists_on_remote() {
+resolve_ref() {
 	local full_path="$1"
 	local ref="$2"
+	local candidate
 
-	git -C "${full_path}" show-ref --verify --quiet "refs/remotes/origin/${ref}"
-}
-
-ref_exists_as_tag() {
-	local full_path="$1"
-	local ref="$2"
-
-	git -C "${full_path}" show-ref --verify --quiet "refs/tags/${ref}"
+	for candidate in "${ref}" "refs/tags/${ref}" "origin/${ref}" FETCH_HEAD; do
+		if git -C "${full_path}" rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+			git -C "${full_path}" rev-parse "${candidate}^{commit}"
+			return 0
+		fi
+	done
+	return 1
 }
 
 ensure_ref_available() {
 	local full_path="$1"
 	local ref="$2"
 
-	if [[ -z "${ref}" ]]; then
+	if resolve_ref "${full_path}" "${ref}" >/dev/null; then
 		return 0
 	fi
-
-	if [[ ${DRY_RUN} -eq 1 && ! -d "${full_path}/.git" ]]; then
-		run_cmd git -C "${full_path}" fetch origin "${ref}"
-		return 0
-	fi
-
-	if git -C "${full_path}" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null ||
-		git -C "${full_path}" rev-parse --verify --quiet "origin/${ref}^{commit}" >/dev/null; then
-		return 0
-	fi
-
-	run_cmd git -C "${full_path}" fetch origin "${ref}"
-}
-
-checkout_ref() {
-	local full_path="$1"
-	local ref="$2"
-
-	if [[ -z "${ref}" ]]; then
-		return 0
-	fi
-
-	# A dry-run may target a directory that has not been cloned yet. In that
-	# case there are no local refs to inspect, so print the generic checkout.
-	if [[ ${DRY_RUN} -eq 1 && ! -d "${full_path}/.git" ]]; then
-		run_cmd git -C "${full_path}" checkout "${ref}"
-		return 0
-	fi
-
-	if ref_exists_on_remote "${full_path}" "${ref}"; then
-		run_cmd git -C "${full_path}" checkout -B "${ref}" "origin/${ref}"
-	elif ref_exists_as_tag "${full_path}" "${ref}"; then
-		run_cmd git -C "${full_path}" checkout --detach "${ref}"
-	else
-		run_cmd git -C "${full_path}" checkout "${ref}"
-	fi
-}
-
-update_repo() {
-	local full_path="$1"
-	local ref="$2"
-
-	run_cmd git -C "${full_path}" fetch --all --tags --prune
-	checkout_ref "${full_path}" "${ref}"
 
 	if [[ ${DRY_RUN} -eq 1 ]]; then
+		run_cmd git -C "${full_path}" fetch --tags origin "${ref}"
+		log "[DRY] fallback if the exact ref is not advertised:"
+		run_cmd git -C "${full_path}" fetch --tags origin '+refs/heads/*:refs/remotes/origin/*'
 		return 0
 	fi
 
-	if [[ -n "${ref}" ]]; then
-		if ref_exists_as_tag "${full_path}" "${ref}" && ! ref_exists_on_remote "${full_path}" "${ref}"; then
-			log "[INFO] ${ref} is a tag; skip git pull."
+	if git -C "${full_path}" fetch --tags origin "${ref}"; then
+		resolve_ref "${full_path}" "${ref}" >/dev/null ||
+			die "Fetched ref but cannot resolve ${ref} in ${full_path}"
+		return 0
+	fi
+
+	warn "Exact ref ${ref} was not advertised; fetching remote heads and tags"
+	if ! git -C "${full_path}" fetch --tags origin '+refs/heads/*:refs/remotes/origin/*'; then
+		die "Unable to fetch advertised refs from origin in ${full_path}"
+	fi
+	resolve_ref "${full_path}" "${ref}" >/dev/null ||
+		die "Locked ref ${ref} is not reachable from advertised heads or tags in ${full_path}"
+}
+
+checkout_detached() {
+	local full_path="$1"
+	local ref="$2"
+	local resolved_ref
+
+	ensure_ref_available "${full_path}" "${ref}"
+	if [[ ${DRY_RUN} -eq 1 ]]; then
+		run_cmd git -C "${full_path}" checkout --detach "${ref}"
+		return 0
+	fi
+
+	resolved_ref="$(resolve_ref "${full_path}" "${ref}")" || die "Unable to resolve ${ref} in ${full_path}"
+	run_cmd git -C "${full_path}" checkout --detach "${resolved_ref}"
+}
+
+sync_submodules() {
+	local full_path="$1"
+	[[ ${WITH_SUBMODULES} -eq 1 ]] || return 0
+
+	run_cmd git -C "${full_path}" submodule sync --recursive
+	run_cmd git -C "${full_path}" submodule update --init --recursive
+}
+
+verify_origin() {
+	local full_path="$1"
+	local expected_url="$2"
+	local actual_url
+
+	actual_url="$(git -C "${full_path}" remote get-url origin 2>/dev/null || true)"
+	[[ -n "${actual_url}" ]] || return 1
+	[[ "$(normalize_repo_url "${actual_url}")" == "$(normalize_repo_url "${expected_url}")" ]]
+}
+
+process_repository() {
+	local manifest_path="$1"
+	local repo_url="$2"
+	local repo_ref="$3"
+	local target_dir="${manifest_path#src/}"
+	local full_path="${SRC_DIR}/${target_dir}"
+	local current_head
+	local expected_head
+
+	log "[PLAN] ${target_dir} <= ${repo_url} @ ${repo_ref}"
+	PLANNED_COUNT=$((PLANNED_COUNT + 1))
+
+	if [[ ! -d "${full_path}/.git" ]]; then
+		if [[ -e "${full_path}" ]]; then
+			if [[ ${DRY_RUN} -eq 1 ]]; then
+				warn "[BLOCK] ${full_path} exists but is not a Git repository"
+				BLOCKER_COUNT=$((BLOCKER_COUNT + 1))
+				return 0
+			fi
+			die "${full_path} exists but is not a Git repository"
+		fi
+		if [[ ${VERIFY_ONLY} -eq 1 ]]; then
+			if [[ ${DRY_RUN} -eq 1 ]]; then
+				warn "[BLOCK] missing repository: ${full_path}"
+				BLOCKER_COUNT=$((BLOCKER_COUNT + 1))
+				return 0
+			fi
+			die "Missing repository: ${full_path}"
+		fi
+
+		log "[CLONE] ${target_dir}"
+		# Use init + exact fetch instead of git clone so the restored dependency
+		# has no implicit local default branch. Only remote refs/tags and the
+		# requested detached commit are created.
+		run_cmd mkdir -p "${full_path}"
+		run_cmd git -C "${full_path}" init
+		run_cmd git -C "${full_path}" remote add origin "${repo_url}"
+		if [[ ${DRY_RUN} -eq 1 ]]; then
+			run_cmd git -C "${full_path}" fetch --tags origin "${repo_ref}"
+			log "[DRY] fallback if the exact ref is not advertised:"
+			run_cmd git -C "${full_path}" fetch --tags origin '+refs/heads/*:refs/remotes/origin/*'
+			run_cmd git -C "${full_path}" checkout --detach "${repo_ref}"
+			if [[ ${WITH_SUBMODULES} -eq 1 ]]; then
+				run_cmd git -C "${full_path}" submodule update --init --recursive
+			fi
+			CLONED_COUNT=$((CLONED_COUNT + 1))
 			return 0
 		fi
-	fi
 
-	local current_branch
-	current_branch="$(git -C "${full_path}" symbolic-ref --quiet --short HEAD || true)"
-	if [[ -z "${current_branch}" ]]; then
-		log "[INFO] Detached HEAD in ${full_path}; skip git pull."
-		return 0
-	fi
-
-	run_cmd git -C "${full_path}" pull --ff-only
-}
-
-clone_or_skip() {
-	local repo_url="$1"
-	local target_dir="$2"
-	local ref="${3:-}"
-
-	local full_path="${SRC_DIR}/${target_dir}"
-	local display_ref="${ref:-default branch}"
-
-	log "[PLAN] URL=${repo_url}"
-	log "[PLAN] PATH=${full_path}"
-	log "[PLAN] REF=${display_ref}"
-
-	if [[ -d "${full_path}/.git" ]]; then
-		log "[SKIP] ${target_dir} already exists"
-		if [[ ${DO_UPDATE} -eq 1 ]]; then
-			log "[UPDT] ${target_dir}"
-			update_repo "${full_path}" "${ref}"
+		checkout_detached "${full_path}" "${repo_ref}"
+		sync_submodules "${full_path}"
+		CLONED_COUNT=$((CLONED_COUNT + 1))
+	else
+		if ! verify_origin "${full_path}" "${repo_url}"; then
+			if [[ ${DRY_RUN} -eq 1 ]]; then
+				warn "[BLOCK] origin mismatch: ${full_path}"
+				BLOCKER_COUNT=$((BLOCKER_COUNT + 1))
+				return 0
+			fi
+			die "Origin URL mismatch in ${full_path}; refusing to change remotes"
 		fi
-		return
+
+		if repo_is_dirty "${full_path}"; then
+			if [[ ${DRY_RUN} -eq 1 ]]; then
+				warn "[BLOCK] dirty repository: ${full_path}"
+				BLOCKER_COUNT=$((BLOCKER_COUNT + 1))
+				return 0
+			fi
+			die "Dirty repository: ${full_path}. Preserve or commit local changes before syncing."
+		fi
+
+		current_head="$(git -C "${full_path}" rev-parse HEAD)"
+		if is_locked_sha "${repo_ref}"; then
+			expected_head="${repo_ref,,}"
+		else
+			expected_head="$(resolve_ref "${full_path}" "${repo_ref}" || true)"
+		fi
+
+		if [[ -n "${expected_head}" && "${current_head,,}" == "${expected_head,,}" ]]; then
+			log "[OK] ${target_dir} already at locked commit"
+			if [[ ${VERIFY_ONLY} -eq 0 ]]; then
+				sync_submodules "${full_path}"
+			fi
+			VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
+			return 0
+		fi
+
+		if [[ ${DO_UPDATE} -eq 0 ]]; then
+			if [[ ${DRY_RUN} -eq 1 ]]; then
+				warn "[BLOCK] ${target_dir} HEAD ${current_head} does not match ${repo_ref}; use --update"
+				BLOCKER_COUNT=$((BLOCKER_COUNT + 1))
+				return 0
+			fi
+			die "${target_dir} HEAD ${current_head} does not match ${repo_ref}; use --update"
+		fi
+
+		log "[SYNC] ${target_dir} -> ${repo_ref} (detached HEAD)"
+		checkout_detached "${full_path}" "${repo_ref}"
+		sync_submodules "${full_path}"
+		UPDATED_COUNT=$((UPDATED_COUNT + 1))
 	fi
 
-	if [[ -e "${full_path}" ]]; then
-		die "${full_path} exists but is not a git repository"
+	if [[ ${DRY_RUN} -eq 0 ]]; then
+		current_head="$(git -C "${full_path}" rev-parse HEAD)"
+		if is_locked_sha "${repo_ref}" && [[ "${current_head,,}" != "${repo_ref,,}" ]]; then
+			die "Post-checkout verification failed for ${target_dir}: ${current_head} != ${repo_ref}"
+		fi
 	fi
-
-	log "[CLONE] ${target_dir}"
-	# Clone first and then use checkout_ref so a ref may be either a branch,
-	# tag, or an exact commit SHA. git clone --branch cannot accept a SHA.
-	run_cmd git clone "${repo_url}" "${full_path}"
-	ensure_ref_available "${full_path}" "${ref}"
-	checkout_ref "${full_path}" "${ref}"
 }
 
-# ============================================================================
-# REPOSITORIES: ROS 2 Foxy + PX4 1.16.2 workspace sources
-#
-# Each repository is represented by three consecutive values:
-#   URL, destination below SRC_DIR, branch/tag/commit.
-# Self-developed branches are retained only while the remote advertises them;
-# otherwise the audited commit is used. Third-party repositories use the exact
-# stable tag at the current HEAD, or the audited commit when no exact tag exists.
-# ============================================================================
-readonly -a REPOSITORIES=(
-	# PX4 messages: PX4 1.16.2 ROS 2/DDS interface; PX4 release tag.
-	"https://github.com/PX4/px4_msgs.git" "px4_msgs" "v1.16.2"
-
-	# DDS Agent: PX4 uXRCE-DDS to ROS 2 Foxy/Fast DDS 2.0.x; PX4 guidance.
-	"https://github.com/eProsima/Micro-XRCE-DDS-Agent.git" "Micro-XRCE-DDS-Agent" "v2.4.2"
-
-	# Gazebo Classic ROS integration: simulation/Nav2 tests; audited Foxy SHA.
-	"https://github.com/ros-simulation/gazebo_ros_pkgs.git" "gazebo_ros_pkgs" "b6f7bf121d0c607825b65a28b227a5459a71821b"
-
-	# IMU filters/RViz: sensor and SLAM stack; stable tag at current HEAD.
-	"https://github.com/ccny-ros-pkg/imu_tools.git" "imu_tools" "2.0.3"
-
-	# RealSense SDK: required by realsense2_camera; current stable tag.
-	"https://github.com/IntelRealSense/librealsense.git" "librealsense" "v2.50.0"
-
-	# MAVLink definitions: required by MAVROS 2.7.0; current release tag.
-	"https://github.com/mavlink/mavlink-gbp-release.git" "mavlink" "release/foxy/mavlink/2022.12.30-1"
-
-	# MAVROS bridge: offboard/telemetry/vision pose; current stable tag.
-	"https://github.com/mavlink/mavros.git" "mavros" "2.7.0"
-
-	# Nav2: Foxy navigation stack; audited SHA because branch has moved.
-	"https://github.com/ros-navigation/navigation2.git" "navigation2" "ca482808a7a7c52ce01ae3c662dc2b980968fc16"
-
-	# Navigation messages: legacy Foxy Nav2 interfaces; current stable tag.
-	"https://github.com/ros-planning/navigation_msgs.git" "navigation_msgs" "2.0.2"
-
-	# BoomBoomFly C++ offboard control; audited SHA because remote master is gone.
-	"https://github.com/AyasOwen/offboard_cpp.git" "offboard_cpp" "77a02dc09212cdaa1d8ee654f0ae42ae0f04e275"
-
-	# offboard_py is present locally, but its recorded remote no longer exists.
-	# It is intentionally excluded until the source is republished.
-
-	# BoomBoomFly launch/MAVROS config; audited SHA because remote master is gone.
-	"https://github.com/AyasOwen/px4_bringup.git" "px4_bringup" "0fbdcbf6ee53d6927de75af1d98f22cf5bd4f917"
-
-	# RealSense ROS camera/messages/descriptions; current stable tag.
-	"https://github.com/IntelRealSense/realsense-ros.git" "realsense-ros" "4.0.4"
-
-	# BoomBoomFly T265 TF-to-MAVROS vision bridge; current main.
-	"https://github.com/AyasOwen/ros2_foxy_vision_to_mavros.git" "ros2_foxy_vision_to_mavros" "main"
-
-	# RPLIDAR ROS 2 driver: laser navigation; audited SHA, no exact tag.
-	"https://github.com/Slamtec/rplidar_ros.git" "rplidar_ros" "24cc9b6dea97e045bda1408eaa867ce730fd3fc3"
-
-	# RTAB-Map core: RGB-D/visual SLAM; current Foxy stable tag.
-	"https://github.com/introlab/rtabmap.git" "rtabmap" "0.21.1-foxy"
-
-	# RTAB-Map ROS wrappers/messages/SLAM; current Foxy stable tag.
-	"https://github.com/introlab/rtabmap_ros.git" "rtabmap_ros" "0.21.1-foxy"
-
-	# Portable serial library: serial_driver dependency; audited master SHA.
-	"https://github.com/RoverRobotics-forks/serial-ros2.git" "serial-ros2" "ae46504ae7d4a199ea9bba0e73a6f083bf172f80"
-
-	# BoomBoomFly serial hardware interface; current main.
-	"https://github.com/BoomBoomFly/serial_driver_ros2.git" "serial_driver_ros2" "main"
-
-	# SLAM toolbox: Foxy Nav2 mapping; audited SHA, no exact tag.
-	"https://github.com/SteveMacenski/slam_toolbox.git" "slam_toolbox" "4786e90c06a4dc6fa811c5057d4e88387fba3829"
-
-	# cv_bridge/OpenCV ROS interfaces: vision nodes; current stable tag.
-	"https://github.com/ros-perception/vision_opencv.git" "vision_opencv" "3.0.7"
-)
-
-install_repositories() {
-	local index
-
-	if (( ${#REPOSITORIES[@]} % 3 != 0 )); then
-		die "REPOSITORIES must contain URL/path/ref triplets"
-	fi
-
-	for ((index = 0; index < ${#REPOSITORIES[@]}; index += 3)); do
-		clone_or_skip \
-			"${REPOSITORIES[index]}" \
-			"${REPOSITORIES[index + 1]}" \
-			"${REPOSITORIES[index + 2]}"
-	done
-}
-
-verify_packages() {
-	# serial_driver_ros2 is the repository directory; package.xml names it serial_driver.
-	local -a required_packages=(px4_msgs offboard_cpp px4_bringup serial_driver)
+verify_ros_packages() {
+	local -a required_packages=(
+		px4_msgs
+		mavros
+		offboard_cpp
+		px4_bringup
+		realsense2_camera
+		vision_to_mavros
+		serial_driver
+	)
 	local package
 	local colcon_output
 	local missing=0
 
-	if [[ ${DRY_RUN} -eq 1 ]]; then
-		log "[DRY] colcon list --base-paths ${SRC_DIR}"
-		for package in "${required_packages[@]}"; do
-			log "[DRY] verify ROS package: ${package}"
-		done
+	[[ ${SKIP_PACKAGE_CHECK} -eq 0 ]] || {
+		log "[SKIP] ROS package discovery disabled"
+		return 0
+	}
+
+	if ! command -v colcon >/dev/null 2>&1; then
+		if [[ ${REQUIRE_COLCON} -eq 1 ]]; then
+			die "colcon is required but not installed"
+		fi
+		warn "colcon not found; repositories are restored but ROS package discovery was skipped"
 		return 0
 	fi
 
-	require_command colcon
-	if ! colcon_output="$(colcon list --base-paths "${SRC_DIR}")"; then
-		die "colcon list failed for ${SRC_DIR}"
+	if [[ ${DRY_RUN} -eq 1 ]]; then
+		run_cmd colcon list --base-paths "${SRC_DIR}"
+		return 0
+	fi
+
+	if ! colcon_output="$(colcon list --base-paths "${SRC_DIR}" 2>&1)"; then
+		if [[ ${REQUIRE_COLCON} -eq 1 ]]; then
+			die "colcon list failed for ${SRC_DIR}: ${colcon_output}"
+		fi
+		warn "colcon list failed; Git repository restoration remains valid"
+		warn "${colcon_output}"
+		return 0
 	fi
 	printf '%s\n' "${colcon_output}"
 
@@ -330,10 +513,26 @@ verify_packages() {
 		fi
 	done
 
-	[[ ${missing} -eq 0 ]] || die "Workspace package verification failed"
+	if [[ ${missing} -ne 0 ]]; then
+		if [[ ${REQUIRE_COLCON} -eq 1 ]]; then
+			die "Workspace package verification failed"
+		fi
+		warn "One or more expected ROS packages were not discovered"
+	fi
 }
 
-install_repositories
-verify_packages
+for record in "${REPOSITORIES[@]}"; do
+	IFS=$'\t' read -r manifest_path repo_url repo_ref <<<"${record}"
+	process_repository "${manifest_path}" "${repo_url}" "${repo_ref}"
+done
 
+verify_ros_packages
+
+log "Summary: planned=${PLANNED_COUNT} cloned=${CLONED_COUNT} updated=${UPDATED_COUNT} verified=${VERIFIED_COUNT} blockers=${BLOCKER_COUNT}"
+
+if [[ ${DRY_RUN} -eq 1 && ${BLOCKER_COUNT} -gt 0 ]]; then
+	warn "Dry-run found ${BLOCKER_COUNT} blocker(s); no files or Git refs were changed"
+fi
+
+log "Intentionally excluded from restore/build: offboard_py, cv_yolo_paddle_pkg, opencv_cpp"
 log "Done."

@@ -16,7 +16,7 @@ Scripts/
 
 ## installation
 
-### 无人机：PX4 + Micro XRCE-DDS
+### 无人机仓库恢复
 
 脚本路径：
 
@@ -24,95 +24,119 @@ Scripts/
 Scripts/installation/uav_px4_dds_install.sh
 ```
 
-该脚本默认会在仓库根目录创建或使用 `src/`，也就是：
+该脚本只负责恢复源码仓库，不安装 ROS 2、系统依赖、udev 规则、PX4 固件或硬件配置。默认读取仓库根目录的 `workspace.lock.repos`，把其中20个仓库恢复到精确 commit SHA。
 
-```text
-BoomBoomFly/src/
-```
+恢复后的依赖仓库统一处于 detached HEAD；脚本不会创建本地开发分支，也不会执行 `git pull`。
 
-随后脚本会把无人机 DDS 方案需要的功能包克隆到这个 `src/` 目录中。
-
-#### 使用方式
-
-在仓库根目录执行：
+#### 在其他平台创建相同仓库集
 
 ```bash
-chmod +x Scripts/installation/uav_px4_dds_install.sh
-./Scripts/installation/uav_px4_dds_install.sh
+git clone https://github.com/wanone111/BoomBoomFly.git
+cd BoomBoomFly
+
+# 先确认20个仓库及精确 SHA，不创建文件
+./Scripts/installation/uav_px4_dds_install.sh \
+  --dry-run \
+  --skip-package-check \
+  --src-dir /path/to/ros2_ws/src
+
+# 确认后恢复源码；没有 ROS/colcon 的主机也可以执行
+./Scripts/installation/uav_px4_dds_install.sh \
+  --src-dir /path/to/ros2_ws/src
 ```
 
-如果依赖仓库已经存在，脚本会跳过，不会重复克隆。需要更新已有仓库时使用：
-
-```bash
-./Scripts/installation/uav_px4_dds_install.sh --update
-```
-
-如果需要把依赖包拉取到其他 ROS 2 工作区：
-
-```bash
-./Scripts/installation/uav_px4_dds_install.sh --src-dir /path/to/workspace/src
-```
-
-执行前查看计划但不实际克隆或更新：
+如果目标就是当前 BoomBoomFly 工作区，可省略 `--src-dir`：
 
 ```bash
 ./Scripts/installation/uav_px4_dds_install.sh --dry-run
+./Scripts/installation/uav_px4_dds_install.sh
 ```
 
-`--update` 会对已存在的 git 仓库执行：
+#### 已有仓库的处理规则
 
-- `git fetch --all --prune`
-- 如果脚本指定了分支或 tag，则先 checkout 到对应版本
-- 如果当前是分支，则执行 `git pull --ff-only`
-- 如果当前是 tag 或 detached HEAD，则跳过 `git pull`
+- origin URL、HEAD 和工作树状态都会被检查。
+- dirty 仓库会被拒绝，脚本不会覆盖本地修改。
+- HEAD 与 lock SHA 不一致时，默认拒绝并提示使用 `--update`。
+- `--update` 只 fetch 并切换到锁定提交，仍然保持 detached HEAD，不创建分支、不 pull。
+- 目标路径已存在但不是 Git 仓库时直接报错。
+- `--verify-only` 只核对现有仓库，不克隆、不更新。
 
-如果目标目录已存在但不是 git 仓库，脚本会报错退出，避免把异常目录误当作可用依赖。
+示例：
 
-#### 拉取内容
+```bash
+# 将已有的干净仓库同步到 lock SHA
+./Scripts/installation/uav_px4_dds_install.sh --update
 
-| 目录 | 仓库 | 版本 |
-| --- | --- | --- |
-| `px4_msgs` | <https://github.com/PX4/px4_msgs.git> | `v1.16.1` |
-| `Micro-XRCE-DDS-Agent` | <https://github.com/eProsima/Micro-XRCE-DDS-Agent.git> | 默认分支 |
-| `vision_to_dds` | <https://github.com/wanone111/vision_to_dds.git> | 默认分支 |
-| `offboard_cpp` | <https://github.com/BoomBoomFly/offboard_cpp.git> | 默认分支 |
-| `serial_driver_ros` | <https://github.com/BoomBoomFly/serial_driver_ros.git> | 默认分支 |
-| `librealsense` | <https://github.com/IntelRealSense/librealsense.git> | `v2.53.1` |
-| `realsense-ros` | <https://github.com/IntelRealSense/realsense-ros.git> | `4.0.4` |
-| `px4_bringup` | <https://github.com/BoomBoomFly/px4_bringup.git> | 默认分支 |
+# 只验证另一工作区
+./Scripts/installation/uav_px4_dds_install.sh \
+  --verify-only \
+  --src-dir /path/to/ros2_ws/src
+```
 
-T265 已不再被 Intel RealSense SDK 2.0 v2.54.1 及后续版本支持，因此这里固定使用 `librealsense v2.53.1` 和 `realsense-ros 4.0.4`。
+#### Manifest 选择
+
+- 默认 `workspace.lock.repos`：20个仓库全部固定为40位 commit SHA，推荐用于部署、CI和跨平台复现。
+- `workspace.repos`：记录 tag/branch/SHA 的维护意图。若明确需要使用它，必须同时传入 `--allow-moving-refs`。
+
+```bash
+./Scripts/installation/uav_px4_dds_install.sh \
+  --manifest workspace.repos \
+  --allow-moving-refs \
+  --dry-run
+```
+
+#### ROS 包检查
+
+- 找到 `colcon` 时，脚本默认执行包发现并检查核心包。
+- 非 ROS 平台没有 `colcon` 时，仅输出警告，仓库恢复仍可成功。
+- `--require-colcon` 将包发现改为强制检查。
+- `--skip-package-check` 完全跳过 ROS 包发现。
+
+#### 其他选项
+
+- 默认递归初始化 Git submodule；使用 `--skip-submodules` 可关闭。
+- 所有写操作前都可通过 `--dry-run` 查看。
+- `--help` 显示完整参数和安全规则。
+
+#### 当前明确排除的内容
+
+以下包已确认不进入 T265 + D435 Offboard 首版恢复、构建和集成范围，源码目录仅作为历史参考保留：
+
+- `offboard_py`
+- `cv_yolo_paddle_pkg`
+- `opencv_cpp`
+
+机器可读清单为仓库根目录的 `workspace.excluded_packages`。安装脚本不会恢复这些包，M1 构建脚本也会显式传入 `--packages-skip`。如需重新纳入，必须先更新排除清单、仓库清单、依赖和验收计划。
+
+#### M1 最小构建
+
+仓库恢复后，先打印 T265 + D435 + MAVROS 最小构建计划：
+
+```bash
+./Scripts/build/m1_build.sh --src-dir /path/to/ros2_ws/src --output-root /path/to/ros2_ws --print-plan
+```
+
+ROS 2 Foxy 上的 MAVROS 2.7.0 需要仓库内已审查的 `tf2_eigen.hpp` → `tf2_eigen.h` 兼容补丁。确认后执行：
+
+```bash
+./Scripts/build/m1_build.sh --src-dir /path/to/ros2_ws/src --output-root /path/to/ros2_ws --apply-patches
+```
+
+该脚本会清除继承的 ROS overlay，仅重新加载 `/opt/ros/foxy`，并构建 `mavros`、`vision_to_mavros`、`realsense2_camera`、`px4_bringup` 及其工作区依赖。它不会启动 ROS 节点或硬件。
 
 #### 构建工作区
 
-默认使用仓库根目录作为 ROS 2 工作区：
+源码恢复后，在具备 Ubuntu 20.04、ROS 2 Foxy 和依赖包的环境中单独执行：
 
 ```bash
-cd /home/aa/px4/BoomBoomFly
+cd /path/to/ros2_ws
 source /opt/ros/foxy/setup.bash
+rosdep check --from-paths src --ignore-src
 colcon build --symlink-install
 source install/setup.bash
 ```
 
-#### 常用启动入口
-
-完成构建并 source 工作区后，可按实际硬件和依赖情况启动：
-
-```bash
-# 完整流程：PX4/视觉/串口/检测/Offboard 主节点
-ros2 launch px4_bringup start_all_2025TI.launch.py
-
-# 串口与图像检测相关节点
-ros2 launch px4_bringup serial_and_image_2025TI.launch.py
-
-# Offboard 控制
-ros2 launch offboard_cpp offboard_control.launch.py
-
-# 多机 Offboard 示例
-ros2 launch offboard_cpp offboard_swarm_control.launch.py
-```
-
-`px4_bringup` 的部分 launch 文件会引用 `mavros`、`realsense2_camera`、`vision_to_mavros`、`serial_driver`、`opencv_cpp`、`cv_yolo_paddle_pkg` 等包。安装脚本不会拉取全部视觉/检测扩展包，运行前需要确认当前工作区已有对应依赖。
+构建成功不等于可以启动完整 bringup 或进行 Offboard 飞行。
 
 ### 小车
 

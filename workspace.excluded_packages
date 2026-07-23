@@ -1,0 +1,5 @@
+# ROS package names intentionally excluded from the T265 + D435 Offboard baseline.
+# Keep the source directories only as archived reference; do not restore or build them.
+offboard_py
+cv_yolo_paddle_pkg
+opencv_cpp
