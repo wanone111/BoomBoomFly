@@ -30,6 +30,9 @@ Restore the repository set declared by workspace.lock.repos. Locked commits are
 checked out in detached-HEAD state; this script never creates dependency branches
 and never runs git pull.
 
+workspace.repos may additionally declare ../communication as the one approved
+moving external repository. It is intentionally absent from workspace.lock.repos.
+
 Options:
   --src-dir <path>       Target ROS 2 src directory. Default: ${SRC_DIR}
   --manifest <path>      Repositories manifest. Default: ${MANIFEST}
@@ -253,13 +256,22 @@ mapfile -t REPOSITORIES <<<"${manifest_data}"
 declare -A SEEN_TARGETS=()
 for record in "${REPOSITORIES[@]}"; do
 	IFS=$'\t' read -r manifest_path repo_url repo_ref <<<"${record}"
-	[[ "${manifest_path}" == src/* ]] || die "Manifest path must be below src/: ${manifest_path}"
-	target_dir="${manifest_path#src/}"
-	if [[ -z "${target_dir}" || "${target_dir}" == /* || "${target_dir}" =~ (^|/)\.\.?(/|$) ]]; then
-		die "Unsafe manifest target: ${manifest_path}"
-	fi
-	[[ -z "${SEEN_TARGETS[${target_dir}]:-}" ]] || die "Duplicate manifest target: ${target_dir}"
-	SEEN_TARGETS[${target_dir}]=1
+	case "${manifest_path}" in
+		src/*)
+			target_key="${manifest_path#src/}"
+			if [[ -z "${target_key}" || "${target_key}" == /* || "${target_key}" =~ (^|/)\.\.?(/|$) ]]; then
+				die "Unsafe manifest target: ${manifest_path}"
+			fi
+			;;
+		../communication)
+			target_key="external:communication"
+			;;
+		*)
+			die "Manifest path must be below src/ or exactly ../communication: ${manifest_path}"
+			;;
+	esac
+	[[ -z "${SEEN_TARGETS[${target_key}]:-}" ]] || die "Duplicate manifest target: ${manifest_path}"
+	SEEN_TARGETS[${target_key}]=1
 
 	if ! is_locked_sha "${repo_ref}" && [[ ${ALLOW_MOVING_REFS} -eq 0 ]]; then
 		die "Manifest ref is not a 40-character lock SHA for ${manifest_path}: ${repo_ref}. Use --allow-moving-refs only when intentional."
@@ -358,10 +370,18 @@ process_repository() {
 	local manifest_path="$1"
 	local repo_url="$2"
 	local repo_ref="$3"
-	local target_dir="${manifest_path#src/}"
-	local full_path="${SRC_DIR}/${target_dir}"
+	local target_dir
+	local full_path
 	local current_head
 	local expected_head
+
+	if [[ "${manifest_path}" == ../communication ]]; then
+		target_dir="../communication"
+		full_path="${PROJECT_ROOT}/../communication"
+	else
+		target_dir="${manifest_path#src/}"
+		full_path="${SRC_DIR}/${target_dir}"
+	fi
 
 	log "[PLAN] ${target_dir} <= ${repo_url} @ ${repo_ref}"
 	PLANNED_COUNT=$((PLANNED_COUNT + 1))
@@ -467,12 +487,9 @@ process_repository() {
 verify_ros_packages() {
 	local -a required_packages=(
 		px4_msgs
-		mavros
 		offboard_cpp
-		px4_bringup
 		realsense2_camera
-		vision_to_mavros
-		serial_driver
+		vision_to_dds
 	)
 	local package
 	local colcon_output
@@ -534,5 +551,6 @@ if [[ ${DRY_RUN} -eq 1 && ${BLOCKER_COUNT} -gt 0 ]]; then
 	warn "Dry-run found ${BLOCKER_COUNT} blocker(s); no files or Git refs were changed"
 fi
 
+log "DDS-only baseline excludes: mavlink, mavros, vision_to_mavros, px4_bringup, legacy serial repositories"
 log "Intentionally excluded from restore/build: offboard_py, cv_yolo_paddle_pkg, opencv_cpp"
 log "Done."

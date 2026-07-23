@@ -19,14 +19,6 @@ repositories:
     type: git
     url: https://github.com/IntelRealSense/librealsense.git
     version: v2.50.0
-  src/mavlink:
-    type: git
-    url: https://github.com/mavlink/mavlink-gbp-release.git
-    version: release/foxy/mavlink/2022.12.30-1
-  src/mavros:
-    type: git
-    url: https://github.com/mavlink/mavros.git
-    version: 2.7.0
   src/navigation2:
     type: git
     url: https://github.com/ros-navigation/navigation2.git
@@ -37,20 +29,12 @@ repositories:
     version: 2.0.2
   src/offboard_cpp:
     type: git
-    url: https://github.com/AyasOwen/offboard_cpp.git
-    version: 77a02dc09212cdaa1d8ee654f0ae42ae0f04e275
-  src/px4_bringup:
-    type: git
-    url: https://github.com/AyasOwen/px4_bringup.git
-    version: 0fbdcbf6ee53d6927de75af1d98f22cf5bd4f917
+    url: https://github.com/BoomBoomFly/offboard_cpp.git
+    version: DDS
   src/realsense-ros:
     type: git
     url: https://github.com/IntelRealSense/realsense-ros.git
     version: 4.0.4
-  src/ros2_foxy_vision_to_mavros:
-    type: git
-    url: https://github.com/AyasOwen/ros2_foxy_vision_to_mavros.git
-    version: main
   src/rplidar_ros:
     type: git
     url: https://github.com/Slamtec/rplidar_ros.git
@@ -63,14 +47,6 @@ repositories:
     type: git
     url: https://github.com/introlab/rtabmap_ros.git
     version: 0.21.1-foxy
-  src/serial-ros2:
-    type: git
-    url: https://github.com/RoverRobotics-forks/serial-ros2.git
-    version: ae46504ae7d4a199ea9bba0e73a6f083bf172f80
-  src/serial_driver_ros2:
-    type: git
-    url: https://github.com/BoomBoomFly/serial_driver_ros2.git
-    version: main
   src/slam_toolbox:
     type: git
     url: https://github.com/SteveMacenski/slam_toolbox.git
@@ -79,3 +55,11 @@ repositories:
     type: git
     url: https://github.com/ros-perception/vision_opencv.git
     version: 3.0.7
+  src/vision_to_dds:
+    type: git
+    url: https://github.com/wanone111/vision_to_dds.git
+    version: main
+  ../communication:
+    type: git
+    url: https://github.com/wanone111/communication.git
+    version: main

@@ -1,232 +1,159 @@
 # BoomBoomFly
 
-BoomBoomFly 是面向 Ubuntu 20.04、ROS 2 Foxy 和 PX4 的无人机伴随计算机工程，覆盖 MAVROS/uXRCE-DDS 通信、T265 视觉定位、Offboard 控制、串口通信、导航建图以及比赛/实机启动编排。
+BoomBoomFly 是面向 Ubuntu 20.04、ROS 2 Foxy 和 PX4 的无人机伴随计算机工程。自 2026-07-23 的 P0-01 基线决策起，仓库只维护 **PX4 uXRCE-DDS** 飞控通信路径；MAVROS、vision-to-MAVROS、旧串口仓库和 MAVROS-only bringup 不再属于受管源码组合。
 
-仓库主要维护安装脚本、可复现依赖清单、启动说明和仿真入口。ROS 2 功能包恢复到工作区 `src/`，PX4-Autopilot 固件源码不在本仓库的受管依赖中。
+PX4-Autopilot 固件源码不在本仓库的受管依赖中。`px4_msgs v1.16.2` 是当前消息定义基线，不等同于已确认的实机固件版本。
 
-## 当前依赖基线
+## 当前源码基线
 
-2026-07-21 工作区审查结果：
+两份 manifest 承担不同职责：
 
-- `src/` 中有 19 个 Git 仓库、79 个 `package.xml`，`colcon list` 可发现 77 个包。
-- 安装脚本、`workspace.repos` 和 `workspace.lock.repos` 共同管理 20 个可获取仓库。
-- PX4 消息固定为 `px4_msgs v1.16.2`。
-- ROS 2 Foxy 使用 `Micro-XRCE-DDS-Agent v2.4.2`。
-- RealSense 基线固定为 `librealsense v2.50.0` 和 `realsense-ros 4.0.4`。
-- 不使用“自动选择最新版本”；稳定组件固定 tag，无对应 tag 时固定审查 commit。
+| 文件 | 条目 | 用途 |
+|---|---:|---|
+| `workspace.lock.repos` | 15 | DDS-only 精确 SHA；部署、CI 和可复现恢复首选 |
+| `workspace.repos` | 16 | 维护意图；Offboard 跟随 `DDS`，`../communication` 跟随 `main` |
 
-完整审查结果见：
+重要例外：
 
-- [src 依赖清单](docs/src_dependency_inventory.md)
-- [安装脚本更新报告](docs/uav_install_script_update.md)
+- `offboard_cpp` 的维护来源是 `BoomBoomFly/offboard_cpp` 的 `DDS` 分支；本次核验的远端 HEAD 为 `8925f8ae82258fb9f1378543f1a0dea16c15a282`，部署 lock 固定该 SHA。
+- `/home/aa/px4_ws/communication` 按维护者要求始终跟随 `wanone111/communication` 的最新 `main`，**不进入精确 lock**。
+- `vision_to_dds` 已正式纳入两份 manifest。
+- `mavlink`、`mavros`、`ros2_foxy_vision_to_mavros`、`px4_bringup`、`serial-ros2` 和旧 `serial_driver` 均已退出受管组合。
+
+完整决策、SHA 和恢复边界见 [源码基线](docs/SOURCE_BASELINE.md)。
 
 ## 目录结构
 
 ```text
-BoomBoomFly/
-├── README.md
-├── workspace.repos              # 人工维护的 branch/tag/commit 意图
-├── workspace.lock.repos         # 全部仓库的精确 commit SHA
-├── Scripts/
-│   ├── README.md
-│   ├── installation/
-│   │   ├── uav_px4_dds_install.sh
-│   │   └── car_install.sh
-│   └── simulation/
-│       └── uav_sim.sh
-├── Simulator/
-│   ├── README.md
-│   ├── gazebo_simulator/
-│   └── realsense_gazebo_plugin/
-├── docs/
-│   ├── src_dependency_inventory.md
-│   └── uav_install_script_update.md
-└── src/                         # 本地 ROS 2 源码工作区
+/home/aa/px4_ws/
+├── BoomBoomFly/
+│   ├── workspace.lock.repos
+│   ├── workspace.repos
+│   ├── Scripts/
+│   ├── docs/
+│   └── src/
+└── communication/               # 移动依赖：跟随 origin/main，不锁 SHA
 ```
 
-`build/`、`install/`、`log/` 和 `src/` 属于本地构建/运行工作区。不要把构建产物当作依赖来源。
+`build/`、`install/`、`log/` 和当前 `src/` 是本地工作区状态，不应充当源码来源。清单中已移出的旧仓库可能暂时仍留在本机 `src/`，但不会被恢复脚本下载或视为基线组成。
 
 ## 环境要求
 
-必需环境：
-
 - Ubuntu 20.04
 - ROS 2 Foxy
-- Bash
-- Git
-- `colcon`
-- PX4 1.16.2 固件或兼容的 PX4 SITL/实机
+- Bash、Git、colcon
+- 按需使用 `vcstool`、`rosdep`
+- 与 `px4_msgs v1.16.2` 匹配的 PX4 firmware、board、参数和 `dds_topics.yaml`：仍待 P0-03 确认
 
-按需要安装：
+恢复脚本只管理源码，不安装系统包、固件、udev 规则或硬件配置，也不启动任何节点。
 
-- `vcstool`：从 `.repos` 文件恢复源码
-- `rosdep`：检查和安装系统依赖
-- RealSense/T265 设备规则与系统库
-- MAVROS GeographicLib 数据集
-- 串口和 udev 权限配置
+## 恢复精确 DDS 基线
 
-安装脚本只恢复源码仓库，不负责安装 ROS 2、系统包、固件、udev 规则或硬件配置。
-
-## 快速开始
-
-### 1. 进入工程目录
+先查看计划：
 
 ```bash
-cd /home/c/BoomBoomFly
-```
-
-### 2. 先查看下载计划
-
-```bash
-bash Scripts/installation/uav_px4_dds_install.sh --dry-run
-```
-
-`--dry-run` 会显示每个仓库的 URL、目标路径和 branch/tag/commit，不会创建目录、clone、fetch 或 checkout。
-
-指定其他源码目录：
-
-```bash
+cd /home/aa/px4_ws/BoomBoomFly
 bash Scripts/installation/uav_px4_dds_install.sh \
   --dry-run \
-  --src-dir /path/to/ros2_ws/src
+  --skip-package-check
 ```
 
-### 3. 恢复源码
-
-确认 dry-run 输出后执行：
+确认后恢复 15 个精确 SHA：
 
 ```bash
 bash Scripts/installation/uav_px4_dds_install.sh
 ```
 
-脚本行为：
-
-- 目标不存在时 clone，并 checkout 指定 tag/branch/SHA。
-- 目标已经是 Git 仓库时跳过，避免重复 clone。
-- 目标存在但不是 Git 仓库时停止并输出错误。
-- 完成后执行 `colcon list --base-paths <src>`。
-- 检查 `px4_msgs`、`offboard_cpp`、`px4_bringup` 和 `serial_driver`。
-
-`serial_driver_ros2` 是仓库目录名，ROS package 的实际名称是 `serial_driver`。
-
-更新已有仓库：
+验证现有工作区而不修改：
 
 ```bash
-bash Scripts/installation/uav_px4_dds_install.sh --update
+bash Scripts/installation/uav_px4_dds_install.sh \
+  --verify-only \
+  --skip-package-check
 ```
 
-`--update` 会 fetch 并切换到清单指定 ref。执行前务必检查子仓库是否 dirty；脚本不会替你清理、reset 或覆盖本地修改。
+脚本拒绝覆盖 dirty 仓库、错误 origin 和错误 HEAD。只有在已确认现有仓库干净且允许切换时，才使用 `--update`。
 
-### 4. 使用 repos 清单恢复
+## 恢复维护组合与 communication
 
-希望按人工维护版本意图导入：
+`workspace.repos` 包含 moving refs，必须显式允许：
 
 ```bash
-vcs import < workspace.repos
+bash Scripts/installation/uav_px4_dds_install.sh \
+  --manifest workspace.repos \
+  --allow-moving-refs \
+  --dry-run \
+  --skip-package-check
 ```
 
-希望按精确 commit 恢复可复现基线：
+确认后去掉 `--dry-run`。该操作会把 `communication` 放在 BoomBoomFly 的同级路径 `../communication`。
 
-```bash
-vcs import < workspace.lock.repos
-```
+注意：
 
-`workspace.lock.repos` 是部署和复现实验的首选。脚本、`workspace.repos` 与 lock 文件当前拥有相同的 20 个目标路径。
+- `communication/main` 每次可能解析到不同提交，因此该命令用于同步维护意图，不用于重现实验。
+- 已存在且 dirty 的 `communication` 会被拒绝；脚本不会 pull、reset 或覆盖本地修改。
+- 需要可审计实验时，应在实验报告中额外记录当次 `git -C ../communication rev-parse HEAD`。
 
-### 5. 安装系统依赖并构建
+## 当前受管软件
 
-所有源码准备完成后：
+| 分类 | 仓库 |
+|---|---|
+| PX4 DDS | `px4_msgs`、`Micro-XRCE-DDS-Agent`、`offboard_cpp`、`vision_to_dds` |
+| RealSense/视觉 | `librealsense`、`realsense-ros`、`vision_opencv` |
+| 导航/SLAM | `navigation2`、`navigation_msgs`、`slam_toolbox`、`rtabmap`、`rtabmap_ros`、`imu_tools` |
+| 仿真/传感器 | `gazebo_ros_pkgs`、`rplidar_ros` |
+| 外部移动通信仓库 | `../communication @ main` |
+
+## 构建边界
+
+本轮 P0-01 不执行构建。源码准备完成后，推荐在新的输出目录中分组验证：
 
 ```bash
 source /opt/ros/foxy/setup.bash
-rosdep install --from-paths src --ignore-src -r -y
+rosdep check --from-paths src --ignore-src
 colcon build --symlink-install
-source install/setup.bash
 ```
 
-首次部署应在独立的新工作区验证，不要直接对包含本地修改的飞行工作区执行更新。
+当前本机仍可能发现已退出基线的 MAVROS、旧 bringup 和旧 serial 包。执行构建前应使用清单生成的新工作区，或显式排除这些本地残留，不能把当前 `src/` 的包数当作 DDS-only 基线包数。
 
-## 受管软件组成
+## 运行安全
 
-| 分类 | 主要仓库 | 版本策略 |
-|---|---|---|
-| PX4/DDS | `px4_msgs`, `Micro-XRCE-DDS-Agent` | `v1.16.2`, `v2.4.2` |
-| MAVLink | `mavlink`, `mavros` | Foxy release tag, `2.7.0` |
-| 飞控与启动 | `offboard_cpp`, `px4_bringup`, `serial_driver_ros2`, `ros2_foxy_vision_to_mavros` | 当前分支仍存在时用分支，否则用审查 SHA |
-| RealSense/视觉 | `librealsense`, `realsense-ros`, `vision_opencv` | `v2.50.0`, `4.0.4`, `3.0.7` |
-| 导航/SLAM | `navigation2`, `navigation_msgs`, `slam_toolbox`, `rtabmap`, `rtabmap_ros`, `imu_tools` | Foxy tag或审查 SHA |
-| 仿真/传感器 | `gazebo_ros_pkgs`, `rplidar_ros`, `serial-ros2` | 审查 SHA |
+当前没有经过验证的 DDS production bringup。不要运行旧的：
 
-逐仓库 URL、ref、commit 和 package 依赖请直接查看 [workspace.repos](workspace.repos) 与 [依赖清单](docs/src_dependency_inventory.md)。
-
-## 已知的不可自动恢复项
-
-当前脚本不能字节级还原审查时的整个 `src/`：
-
-1. `offboard_py` 的历史 remote 已返回 `Repository not found`，因此没有硬编码到下载列表。
-2. `cv_yolo_paddle_pkg` 和 `opencv_cpp` 没有 Git 元数据或可信源码 URL。
-3. 审查时有 9 个子仓库包含未提交修改；lock 只能恢复其提交基线。
-4. 本地删除、未跟踪源码和文件权限变化不会进入 commit lock。
-5. PX4-Autopilot 固件源码不在当前工作区，因此没有虚构安装项。
-
-要实现完整新设备一键部署，需先重新发布 `offboard_py`，为两个本地视觉包建立仓库，并把需要保留的本地修改提交到可访问 remote。
-
-## 常用启动入口
-
-构建并 source 工作区后，按硬件配置启动：
-
-```bash
-# 完整流程：PX4、视觉、串口、检测和 Offboard 主节点
-ros2 launch px4_bringup start_all_2025TI.launch.py
-
-# 串口与图像检测节点
-ros2 launch px4_bringup serial_and_image_2025TI.launch.py
-
-# Offboard 控制
-ros2 launch offboard_cpp offboard_control.launch.py
-
-# 多机 Offboard 示例
-ros2 launch offboard_cpp offboard_swarm_control.launch.py
+```text
+px4_bringup/start_all_2025TI.launch.py
 ```
 
-部分 bringup 文件引用当前无法自动恢复的 `opencv_cpp`、`cv_yolo_paddle_pkg` 或 `offboard_py`。缺包时不要启动对应组合入口。
+它属于已退出基线的 MAVROS 架构，并包含失效引用和真实硬件入口。P0 安全风险关闭前，不启动 Agent、Offboard 控制、飞控 mode/arming、视觉注入或任何硬件节点。
 
-实机起飞前至少确认：
+P0-02 已冻结控制权规则：
 
-```bash
-colcon list
-ros2 topic list
-ros2 topic list | grep -E 'fmu|mavros'
-```
+- `/offboard_control_node` 是三个 PX4 控制输入的唯一 writer；
+- `/vision_to_dds_node` 是外部视觉和可选精降目标的唯一 writer；
+- 每个 profile 只允许一个 mission owner；
+- 当前只支持单机根 namespace；
+- production profile 在运行时 owner/lease、graph guard 和安全状态机完成前保持禁用。
 
-同时检查飞控模式、遥控器、里程计、DDS Agent/MAVROS 链路、电池、失控保护和急停方案。源码构建成功不等于可以安全起飞。
+详见 [ADR-0001](docs/adr/0001-dds-only-control-authority.md) 和 [控制权矩阵](docs/CONTROL_AUTHORITY_MATRIX.md)。
 
-## 仿真
+## 维护规则
 
-仿真目录位于 `Simulator/`，入口为 `Scripts/simulation/uav_sim.sh`。当前仿真脚本以及 `gazebo_simulator`、`realsense_gazebo_plugin` 文档仍需要结合实际 PX4 SITL 环境完善。
+1. `workspace.lock.repos` 的 15 个条目必须使用 40 位 SHA。
+2. Offboard 更新时先核验 `origin/DDS`，再更新 lock SHA。
+3. `communication` 是唯一允许不锁 SHA 的外部仓库；每次验证必须记录实际 HEAD。
+4. 不重新加入 MAVROS、旧 vision-to-MAVROS、旧 serial 或旧 bringup，除非维护者重新做架构决策。
+5. 不保存第三方仓库的临时构建缓存或本地补丁作为当前 DDS 基线。
+6. 更新 manifest 后执行 shell 语法、清单路径、URL、SHA、重复项和 dry-run 校验。
+7. 构建成功不等于可以连接飞控或安全起飞。
 
-## 小车
+## 文档
 
-小车安装入口为 `Scripts/installation/car_install.sh`，当前仍为占位内容。
-
-## 维护依赖版本
-
-修改依赖前：
-
-1. 审查 `src/` 中的 package、remote、branch、HEAD、dirty 和 detached 状态。
-2. 只选择经过兼容性验证的 tag/commit，不追随 latest。
-3. 同步修改脚本、`workspace.repos` 和 `workspace.lock.repos`。
-4. 用精确 SHA 更新 lock 文件。
-5. 执行 `bash -n`、`shellcheck`、默认 dry-run、空目录 dry-run、清单去重和 YAML 校验。
-6. 在新工作区完成 `rosdep`、`colcon build` 和硬件前验证。
-
-## 参考文档
-
-- [Scripts 使用说明](Scripts/README.md)
-- [Simulator 说明](Simulator/README.md)
-- [工作区依赖清单](docs/src_dependency_inventory.md)
-- [安装脚本更新报告](docs/uav_install_script_update.md)
-- [PX4 ROS 2 User Guide](https://docs.px4.io/main/en/ros2/)
-- [PX4 uXRCE-DDS](https://docs.px4.io/main/en/middleware/uxrce_dds)
-- [Micro-XRCE-DDS-Agent](https://github.com/eProsima/Micro-XRCE-DDS-Agent)
-- [Intel RealSense ROS](https://github.com/IntelRealSense/realsense-ros)
+- [下一窗口交接](docs/handoff.md)
+- [文档中心](docs/README.md)
+- [源码基线与恢复说明](docs/SOURCE_BASELINE.md)
+- [控制权与发布者矩阵](docs/CONTROL_AUTHORITY_MATRIX.md)
+- [ADR-0001：DDS-only 控制权](docs/adr/0001-dds-only-control-authority.md)
+- [仓库状态](docs/REPOSITORY_STATUS.md)
+- [构建与运行状态](docs/BUILD_AND_RUNTIME_STATUS.md)
+- [风险与阻塞项](docs/RISKS_AND_BLOCKERS.md)
+- [下一阶段任务](docs/NEXT_STAGE_TASKS.md)

@@ -24,7 +24,7 @@ Scripts/
 Scripts/installation/uav_px4_dds_install.sh
 ```
 
-该脚本只负责恢复源码仓库，不安装 ROS 2、系统依赖、udev 规则、PX4 固件或硬件配置。默认读取仓库根目录的 `workspace.lock.repos`，把其中20个仓库恢复到精确 commit SHA。
+该脚本只负责恢复源码仓库，不安装 ROS 2、系统依赖、udev 规则、PX4 固件或硬件配置。默认读取仓库根目录的 `workspace.lock.repos`，把其中 15 个 DDS-only 仓库恢复到精确 commit SHA。
 
 恢复后的依赖仓库统一处于 detached HEAD；脚本不会创建本地开发分支，也不会执行 `git pull`。
 
@@ -34,7 +34,7 @@ Scripts/installation/uav_px4_dds_install.sh
 git clone https://github.com/wanone111/BoomBoomFly.git
 cd BoomBoomFly
 
-# 先确认20个仓库及精确 SHA，不创建文件
+# 先确认 15 个仓库及精确 SHA，不创建文件
 ./Scripts/installation/uav_px4_dds_install.sh \
   --dry-run \
   --skip-package-check \
@@ -75,8 +75,9 @@ cd BoomBoomFly
 
 #### Manifest 选择
 
-- 默认 `workspace.lock.repos`：20个仓库全部固定为40位 commit SHA，推荐用于部署、CI和跨平台复现。
-- `workspace.repos`：记录 tag/branch/SHA 的维护意图。若明确需要使用它，必须同时传入 `--allow-moving-refs`。
+- 默认 `workspace.lock.repos`：15 个 DDS-only 仓库全部固定为 40 位 commit SHA，推荐用于部署、CI 和跨平台复现。
+- `workspace.repos`：16 个维护条目。其中 `offboard_cpp` 跟随 `DDS`，唯一外部路径 `../communication` 跟随 `main`；若使用它，必须同时传入 `--allow-moving-refs`。
+- `communication` 按维护者决策不进入 lock。每次实验或发布必须单独记录它的实际 HEAD。
 
 ```bash
 ./Scripts/installation/uav_px4_dds_install.sh \
@@ -106,23 +107,26 @@ cd BoomBoomFly
 - `cv_yolo_paddle_pkg`
 - `opencv_cpp`
 
+DDS-only 决策还移出了：
+
+- `mavlink`、`libmavconn`、`mavros`、`mavros_msgs`、`mavros_extras`
+- `vision_to_mavros`
+- MAVROS-only `px4_bringup`
+- 旧 `serial`、`serial_driver` 源仓库
+
+后续串口代码只从同级的 `../communication` 获取；该仓库是 moving dependency。
+
 机器可读清单为仓库根目录的 `workspace.excluded_packages`。安装脚本不会恢复这些包，M1 构建脚本也会显式传入 `--packages-skip`。如需重新纳入，必须先更新排除清单、仓库清单、依赖和验收计划。
 
-#### M1 最小构建
+#### 历史 M1 构建脚本
 
-仓库恢复后，先打印 T265 + D435 + MAVROS 最小构建计划：
+`Scripts/build/m1_build.sh` 是旧 T265 + D435 + MAVROS 基线的历史工具，不属于当前 DDS-only 恢复或验收路径。它仍可只读打印旧计划：
 
 ```bash
 ./Scripts/build/m1_build.sh --src-dir /path/to/ros2_ws/src --output-root /path/to/ros2_ws --print-plan
 ```
 
-ROS 2 Foxy 上的 MAVROS 2.7.0 需要仓库内已审查的 `tf2_eigen.hpp` → `tf2_eigen.h` 兼容补丁。确认后执行：
-
-```bash
-./Scripts/build/m1_build.sh --src-dir /path/to/ros2_ws/src --output-root /path/to/ros2_ws --apply-patches
-```
-
-该脚本会清除继承的 ROS overlay，仅重新加载 `/opt/ros/foxy`，并构建 `mavros`、`vision_to_mavros`、`realsense2_camera`、`px4_bringup` 及其工作区依赖。它不会启动 ROS 节点或硬件。
+不要再使用其 `--apply-patches` 或实际 MAVROS 构建路径：MAVROS 补丁已按维护者要求删除。DDS-only 分组构建将在后续 P1-02 中重新建立。
 
 #### 构建工作区
 
